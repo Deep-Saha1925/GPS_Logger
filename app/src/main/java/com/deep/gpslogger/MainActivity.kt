@@ -63,6 +63,10 @@ class MainActivity : ComponentActivity() {
     private var selectedIntervalSeconds = mutableStateOf(10)
     private var rowCount = mutableStateOf(0)
 
+    // ---- New: on-screen display state (purely additive, doesn't affect logging logic) ----
+    private var currentFileName = mutableStateOf("")
+    private var currentLocationText = mutableStateOf("Location: —")
+
     private val intervalOptions = listOf(5, 10, 30, 60)
 
     // ---- Trip-tracking state (reset each time a new session starts) ----
@@ -73,6 +77,9 @@ class MainActivity : ComponentActivity() {
 
     private val locationListener = LocationListener { location ->
         latestLocation = location
+        currentLocationText.value = String.format(
+            Locale.US, "Location: %.5f, %.5f", location.latitude, location.longitude
+        )
     }
 
     private fun isLocationEnabled(): Boolean {
@@ -108,11 +115,21 @@ class MainActivity : ComponentActivity() {
                         val status by statusText
                         val interval by selectedIntervalSeconds
                         val count by rowCount
+                        val fileName by currentFileName
+                        val locationDisplay by currentLocationText
 
                         var expanded by remember { mutableStateOf(false) }
 
                         Text(text = status)
                         Text(text = "Rows logged: $count", modifier = Modifier.padding(top = 8.dp))
+
+                        if (fileName.isNotBlank()) {
+                            Text(text = "File: $fileName", modifier = Modifier.padding(top = 8.dp))
+                        }
+
+                        if (logging) {
+                            Text(text = locationDisplay, modifier = Modifier.padding(top = 8.dp))
+                        }
 
                         Text(text = "Polling interval: ${interval}s", modifier = Modifier.padding(top = 24.dp))
 
@@ -190,6 +207,7 @@ class MainActivity : ComponentActivity() {
         stopOrderCounter = 0
         loggingStartTimeMillis = System.currentTimeMillis()
         isPaused.value = false
+        currentLocationText.value = "Location: —"
 
         // Seed with last known location so we have something to log immediately
         latestLocation = try {
@@ -284,6 +302,7 @@ class MainActivity : ComponentActivity() {
 
         isLogging.value = false
         isPaused.value = false
+        currentLocationText.value = "Location: —"
         statusText.value = "Stopped. Saved ${rowCount.value} rows."
     }
 
@@ -410,6 +429,7 @@ class MainActivity : ComponentActivity() {
 
     private fun createCsvFile(): OutputStream {
         val fileName = "gps_log_${System.currentTimeMillis()}.csv"
+        currentFileName.value = fileName
 
         val values = ContentValues().apply {
             put(MediaStore.Downloads.DISPLAY_NAME, fileName)
