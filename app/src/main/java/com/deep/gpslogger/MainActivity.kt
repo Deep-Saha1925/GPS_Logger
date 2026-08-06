@@ -142,7 +142,10 @@ class MainActivity : ComponentActivity() {
 
                         if (!logging) {
                             Button(
-                                onClick = { checkPermissionAndStart() },
+                                onClick = {
+                                    isLogging.value = true // optimistic lock, prevents double-tap race
+                                    checkPermissionAndStart()
+                                },
                                 modifier = Modifier.padding(top = 24.dp)
                             ) {
                                 Text("Start Logging")
