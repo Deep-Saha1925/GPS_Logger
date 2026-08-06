@@ -39,7 +39,10 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import org.json.JSONArray
 import java.io.OutputStream
+import java.net.HttpURLConnection
+import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -77,9 +80,11 @@ class MainActivity : ComponentActivity() {
                 locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
     }
 
-    private val requestPermission =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-            if (granted) {
+    private val requestPermissions =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
+            val fineGranted = results[Manifest.permission.ACCESS_FINE_LOCATION] == true
+            val coarseGranted = results[Manifest.permission.ACCESS_COARSE_LOCATION] == true
+            if (fineGranted || coarseGranted) {
                 startLogging()
             } else {
                 statusText.value = "Location permission denied."
@@ -153,14 +158,22 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun checkPermissionAndStart() {
-        val hasPermission = ContextCompat.checkSelfPermission(
+        val fineGranted = ContextCompat.checkSelfPermission(
             this, Manifest.permission.ACCESS_FINE_LOCATION
         ) == PackageManager.PERMISSION_GRANTED
+        val coarseGranted = ContextCompat.checkSelfPermission(
+            this, Manifest.permission.ACCESS_COARSE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
 
-        if (hasPermission) {
+        if (fineGranted || coarseGranted) {
             startLogging()
         } else {
-            requestPermission.launch(Manifest.permission.ACCESS_FINE_LOCATION)
+            requestPermissions.launch(
+                arrayOf(
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION
+                )
+            )
         }
     }
 
@@ -215,16 +228,24 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startLocationUpdates() {
-        try {
-            locationManager.requestLocationUpdates(
-                LocationManager.GPS_PROVIDER,
-                1000L,
-                0f,
-                locationListener
-            )
-            Log.d("GPSLogger", "Location updates requested successfully.")
-        } catch (e: SecurityException) {
-            statusText.value = "Permission error starting GPS."
+        var registeredAny = false
+        for (provider in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)) {
+            if (!locationManager.isProviderEnabled(provider)) continue
+            try {
+                locationManager.requestLocationUpdates(
+                    provider,
+                    1000L,
+                    0f,
+                    locationListener
+                )
+                registeredAny = true
+                Log.d("GPSLogger", "Subscribed to $provider updates.")
+            } catch (e: SecurityException) {
+                Log.d("GPSLogger", "No permission for $provider: ${e.message}")
+            }
+        }
+        if (!registeredAny) {
+            statusText.value = "No location provider available/permitted."
         }
     }
 
@@ -277,10 +298,14 @@ class MainActivity : ComponentActivity() {
         }
         previousLocation = loc
 
-        // Hard 2s timeout: a hung/slow network geocode call must never block
-        // the write loop. If it doesn't return in time, fall back immediately.
+        // 1. Try Android's Geocoder first (best granularity: street/neighborhood).
+        // 2. If it returns nothing usable, fall back to OpenWeatherMap (city-level).
+        // 3. If both fail, use "Stop N". Each step is timeout-guarded so a
+        //    hung network call can never stall the write loop.
         val stopName = withTimeoutOrNull(2000L) {
-            withContext(Dispatchers.IO) { reverseGeocode(loc.latitude, loc.longitude) }
+            withContext(Dispatchers.IO) { reverseGeocodeAndroid(loc.latitude, loc.longitude) }
+        } ?: withTimeoutOrNull(2000L) {
+            withContext(Dispatchers.IO) { reverseGeocodeOWM(loc.latitude, loc.longitude) }
         } ?: "Stop $stopOrderCounter"
 
         val distanceStr = String.format(Locale.US, "%.2f", cumulativeDistanceKm)
@@ -299,9 +324,10 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Reverse-geocodes a lat/lon into a short place name.
-     * Runs on Dispatchers.IO (blocking call) and falls back gracefully
-     * if geocoding is unavailable (no network, no Play services, etc.)
+     * Reverse-geocodes a lat/lon into a short place name using Android's
+     * built-in Geocoder (Google backend). Returns null - not a placeholder -
+     * when nothing usable comes back, so the caller can fall through to
+     * the OpenWeatherMap fallback.
      *
      * Note: Geocoder often returns a Plus Code (e.g. "FGJQ+Q96") in
      * featureName when there's no named street/POI nearby (common in
@@ -314,12 +340,12 @@ class MainActivity : ComponentActivity() {
         return !plusCodePattern.containsMatchIn(name)
     }
 
-    private fun reverseGeocode(lat: Double, lon: Double): String {
-        if (!Geocoder.isPresent()) return "Stop $stopOrderCounter"
+    private fun reverseGeocodeAndroid(lat: Double, lon: Double): String? {
+        if (!Geocoder.isPresent()) return null
         return try {
             @Suppress("DEPRECATION")
             val addresses = geocoder.getFromLocation(lat, lon, 1)
-            val addr = addresses?.firstOrNull() ?: return "Stop $stopOrderCounter"
+            val addr = addresses?.firstOrNull() ?: return null
 
             // Prefer real, human-readable names over featureName,
             // since featureName is where Plus Codes usually show up.
@@ -331,9 +357,46 @@ class MainActivity : ComponentActivity() {
                 addr.featureName        // last resort - may be a Plus Code
             )
 
-            candidates.firstOrNull { isUsableName(it) } ?: "Stop $stopOrderCounter"
+            candidates.firstOrNull { isUsableName(it) }
         } catch (e: Exception) {
-            "Stop $stopOrderCounter"
+            null
+        }
+    }
+
+    /**
+     * Fallback reverse geocoder using OpenWeatherMap's Geocoding API.
+     * Coarser than Geocoder (city/district level only, no street names)
+     * but tends to reliably return *something*, so it's used only when
+     * the Android geocoder comes back empty. Returns null on any
+     * failure (no key configured, no network, bad response, etc.)
+     * so the caller can fall back to "Stop N".
+     */
+    private fun reverseGeocodeOWM(lat: Double, lon: Double): String? {
+        val apiKey = BuildConfig.OWM_API_KEY
+        if (apiKey.isBlank()) return null
+
+        var connection: HttpURLConnection? = null
+        return try {
+            val urlStr = "https://api.openweathermap.org/geo/1.0/reverse" +
+                    "?lat=$lat&lon=$lon&limit=1&appid=$apiKey"
+            connection = (URL(urlStr).openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 2000
+                readTimeout = 2000
+            }
+
+            if (connection.responseCode != HttpURLConnection.HTTP_OK) return null
+
+            val body = connection.inputStream.bufferedReader().use { it.readText() }
+            val results = JSONArray(body)
+            if (results.length() == 0) return null
+
+            val name = results.getJSONObject(0).optString("name", "")
+            if (name.isBlank()) null else name
+        } catch (e: Exception) {
+            null
+        } finally {
+            connection?.disconnect()
         }
     }
 
