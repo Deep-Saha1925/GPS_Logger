@@ -83,6 +83,12 @@ class LocationLoggingService : Service() {
                 return START_NOT_STICKY
             }
             ACTION_START -> {
+                if (isRunning) {
+                    // Already logging - ignore duplicate start requests instead
+                    // of spawning a second write loop / output stream.
+                    Log.w("GPSLoggerService", "Ignored duplicate ACTION_START while already running")
+                    return START_STICKY
+                }
                 intervalSeconds = intent.getIntExtra(EXTRA_INTERVAL_SECONDS, 10)
                 val fileName = intent.getStringExtra(EXTRA_FILE_NAME) ?: "gps_log_${System.currentTimeMillis()}.csv"
                 val customUriStr = intent.getStringExtra(EXTRA_CUSTOM_URI)
