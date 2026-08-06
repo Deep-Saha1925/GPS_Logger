@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Button
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.getValue
@@ -66,6 +67,7 @@ class MainActivity : ComponentActivity() {
     // ---- New: on-screen display state (purely additive, doesn't affect logging logic) ----
     private var currentFileName = mutableStateOf("")
     private var currentLocationText = mutableStateOf("Location: —")
+    private var userFileNameInput = mutableStateOf("")
 
     private val intervalOptions = listOf(5, 10, 30, 60)
 
@@ -117,11 +119,22 @@ class MainActivity : ComponentActivity() {
                         val count by rowCount
                         val fileName by currentFileName
                         val locationDisplay by currentLocationText
+                        val fileNameInput by userFileNameInput
 
                         var expanded by remember { mutableStateOf(false) }
 
                         Text(text = status)
                         Text(text = "Rows logged: $count", modifier = Modifier.padding(top = 8.dp))
+
+                        if (!logging) {
+                            OutlinedTextField(
+                                value = fileNameInput,
+                                onValueChange = { userFileNameInput.value = it },
+                                label = { Text("File name (optional)") },
+                                placeholder = { Text("e.g. Monday_Route") },
+                                modifier = Modifier.padding(top = 8.dp)
+                            )
+                        }
 
                         if (fileName.isNotBlank()) {
                             Text(text = "File: $fileName", modifier = Modifier.padding(top = 8.dp))
