@@ -112,7 +112,7 @@ class MainActivity : ComponentActivity() {
                         statusText.value = "Could not open the selected file."
                         return@registerForActivityResult
                     }
-                    currentFileName.value = uri.lastPathSegment?.substringAfterLast('/') ?: "selected_file.csv"
+                    currentFileName.value = queryDisplayName(uri) ?: "selected_file.csv"
                     beginActualLogging(stream)
                 } catch (e: Exception) {
                     statusText.value = "Failed to open file: ${e.message}"
@@ -121,6 +121,24 @@ class MainActivity : ComponentActivity() {
                 statusText.value = "File selection cancelled."
             }
         }
+
+    // Asks the system content resolver for the file's real display name,
+    // since the URI itself (uri.lastPathSegment) is often an opaque
+    // provider-specific ID and NOT the actual filename.
+    private fun queryDisplayName(uri: android.net.Uri): String? {
+        return try {
+            contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                val nameIndex = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                if (nameIndex >= 0 && cursor.moveToFirst()) {
+                    cursor.getString(nameIndex)
+                } else {
+                    null
+                }
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
