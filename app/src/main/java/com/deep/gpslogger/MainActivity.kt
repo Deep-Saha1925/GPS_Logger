@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.OutlinedTextField
@@ -64,14 +65,15 @@ class MainActivity : ComponentActivity() {
     private var selectedIntervalSeconds = mutableStateOf(10)
     private var rowCount = mutableStateOf(0)
 
-    // ---- New: on-screen display state (purely additive, doesn't affect logging logic) ----
     private var currentFileName = mutableStateOf("")
     private var currentLocationText = mutableStateOf("Location: —")
     private var userFileNameInput = mutableStateOf("")
 
+    // New: lets the user pick exactly where the file is saved
+    private var useCustomLocation = mutableStateOf(false)
+
     private val intervalOptions = listOf(5, 10, 30, 60)
 
-    // ---- Trip-tracking state (reset each time a new session starts) ----
     private var previousLocation: Location? = null
     private var cumulativeDistanceKm = 0.0
     private var loggingStartTimeMillis = 0L
@@ -94,9 +96,29 @@ class MainActivity : ComponentActivity() {
             val fineGranted = results[Manifest.permission.ACCESS_FINE_LOCATION] == true
             val coarseGranted = results[Manifest.permission.ACCESS_COARSE_LOCATION] == true
             if (fineGranted || coarseGranted) {
-                startLogging()
+                acquireOutputStreamAndStart()
             } else {
                 statusText.value = "Location permission denied."
+            }
+        }
+
+    // New: system "Save As" style picker for a custom save location
+    private val createDocumentLauncher =
+        registerForActivityResult(ActivityResultContracts.CreateDocument("text/csv")) { uri ->
+            if (uri != null) {
+                try {
+                    val stream = contentResolver.openOutputStream(uri)
+                    if (stream == null) {
+                        statusText.value = "Could not open the selected file."
+                        return@registerForActivityResult
+                    }
+                    currentFileName.value = uri.lastPathSegment?.substringAfterLast('/') ?: "selected_file.csv"
+                    beginActualLogging(stream)
+                } catch (e: Exception) {
+                    statusText.value = "Failed to open file: ${e.message}"
+                }
+            } else {
+                statusText.value = "File selection cancelled."
             }
         }
 
@@ -120,6 +142,7 @@ class MainActivity : ComponentActivity() {
                         val fileName by currentFileName
                         val locationDisplay by currentLocationText
                         val fileNameInput by userFileNameInput
+                        val customLocation by useCustomLocation
 
                         var expanded by remember { mutableStateOf(false) }
 
@@ -134,6 +157,17 @@ class MainActivity : ComponentActivity() {
                                 placeholder = { Text("e.g. Monday_Route") },
                                 modifier = Modifier.padding(top = 8.dp)
                             )
+
+                            Row(modifier = Modifier.padding(top = 8.dp)) {
+                                Checkbox(
+                                    checked = customLocation,
+                                    onCheckedChange = { useCustomLocation.value = it }
+                                )
+                                Text(
+                                    text = "Choose save location manually",
+                                    modifier = Modifier.padding(start = 4.dp)
+                                )
+                            }
                         }
 
                         if (fileName.isNotBlank()) {
@@ -196,7 +230,7 @@ class MainActivity : ComponentActivity() {
         ) == PackageManager.PERMISSION_GRANTED
 
         if (fineGranted || coarseGranted) {
-            startLogging()
+            acquireOutputStreamAndStart()
         } else {
             requestPermissions.launch(
                 arrayOf(
@@ -207,14 +241,42 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun startLogging() {
+    private fun sanitizedFileName(): String {
+        val rawName = userFileNameInput.value.trim()
+        return if (rawName.isNotBlank()) {
+            val sanitized = rawName.replace(Regex("[^A-Za-z0-9_\\-]"), "_")
+            if (sanitized.endsWith(".csv", ignoreCase = true)) sanitized else "$sanitized.csv"
+        } else {
+            "gps_log_${System.currentTimeMillis()}.csv"
+        }
+    }
 
+    // Decides where the file goes: either opens the system picker (custom location)
+    // or auto-creates it in Downloads/gps_logs (default), then hands off to
+    // beginActualLogging() once we have a writable stream.
+    private fun acquireOutputStreamAndStart() {
         if (!isLocationEnabled()) {
             statusText.value = "Please turn ON Location in phone settings first."
             return
         }
 
-        // Reset trip state for a fresh session
+        if (useCustomLocation.value) {
+            createDocumentLauncher.launch(sanitizedFileName())
+        } else {
+            try {
+                val stream = createCsvFile()
+                beginActualLogging(stream)
+            } catch (e: Exception) {
+                statusText.value = "Failed to create file: ${e.message}"
+            }
+        }
+    }
+
+    // All the actual GPS/logging setup — unchanged from before, just now
+    // takes the already-opened stream instead of creating it itself.
+    private fun beginActualLogging(stream: OutputStream) {
+        outputStream = stream
+
         previousLocation = null
         cumulativeDistanceKm = 0.0
         stopOrderCounter = 0
@@ -222,7 +284,6 @@ class MainActivity : ComponentActivity() {
         isPaused.value = false
         currentLocationText.value = "Location: —"
 
-        // Seed with last known location so we have something to log immediately
         latestLocation = try {
             locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)
                 ?: locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
@@ -231,11 +292,10 @@ class MainActivity : ComponentActivity() {
         }
 
         try {
-            outputStream = createCsvFile()
             outputStream?.write("stop_order,stop_name,latitude,longitude,distance_km,time_elapsed\n".toByteArray())
             outputStream?.flush()
         } catch (e: Exception) {
-            statusText.value = "Failed to create file: ${e.message}"
+            statusText.value = "Failed to write header: ${e.message}"
             return
         }
 
@@ -246,9 +306,7 @@ class MainActivity : ComponentActivity() {
         statusText.value = "Logging every ${selectedIntervalSeconds.value}s..."
 
         loggingJob = scope.launch {
-            // Write an initial row right away if we have any fix at all
             latestLocation?.let { loc -> writeRow(loc) }
-
             while (true) {
                 delay(selectedIntervalSeconds.value * 1000L)
                 if (!isPaused.value) {
@@ -282,12 +340,10 @@ class MainActivity : ComponentActivity() {
 
     private fun togglePause() {
         if (isPaused.value) {
-            // Resume
             isPaused.value = false
             startLocationUpdates()
             statusText.value = "Logging every ${selectedIntervalSeconds.value}s..."
         } else {
-            // Pause
             isPaused.value = true
             try {
                 locationManager.removeUpdates(locationListener)
@@ -330,10 +386,6 @@ class MainActivity : ComponentActivity() {
         }
         previousLocation = loc
 
-        // 1. Try Android's Geocoder first (best granularity: street/neighborhood).
-        // 2. If it returns nothing usable, fall back to OpenWeatherMap (city-level).
-        // 3. If both fail, use "Stop N". Each step is timeout-guarded so a
-        //    hung network call can never stall the write loop.
         val stopName = withTimeoutOrNull(2000L) {
             withContext(Dispatchers.IO) { reverseGeocodeAndroid(loc.latitude, loc.longitude) }
         } ?: withTimeoutOrNull(2000L) {
@@ -341,8 +393,6 @@ class MainActivity : ComponentActivity() {
         } ?: "Stop $stopOrderCounter"
 
         val distanceStr = String.format(Locale.US, "%.2f", cumulativeDistanceKm)
-
-        // Quote stop_name for CSV safety (it may contain commas)
         val safeStopName = "\"" + stopName.replace("\"", "\"\"") + "\""
 
         val line = "$stopOrderCounter,$safeStopName,${loc.latitude},${loc.longitude},$distanceStr,$elapsedFormatted\n"
@@ -355,16 +405,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /**
-     * Reverse-geocodes a lat/lon into a short place name using Android's
-     * built-in Geocoder (Google backend). Returns null - not a placeholder -
-     * when nothing usable comes back, so the caller can fall through to
-     * the OpenWeatherMap fallback.
-     *
-     * Note: Geocoder often returns a Plus Code (e.g. "FGJQ+Q96") in
-     * featureName when there's no named street/POI nearby (common in
-     * rural areas). We explicitly skip those and prefer real names.
-     */
     private val plusCodePattern = Regex("^[23456789CFGHJMPQRVWX]{4,8}\\+[23456789CFGHJMPQRVWX]{2,3}(\\s|$)")
 
     private fun isUsableName(name: String?): Boolean {
@@ -379,14 +419,12 @@ class MainActivity : ComponentActivity() {
             val addresses = geocoder.getFromLocation(lat, lon, 1)
             val addr = addresses?.firstOrNull() ?: return null
 
-            // Prefer real, human-readable names over featureName,
-            // since featureName is where Plus Codes usually show up.
             val candidates = listOf(
-                addr.thoroughfare,      // street name
-                addr.subLocality,       // neighborhood
-                addr.locality,          // town/city
-                addr.subAdminArea,      // district
-                addr.featureName        // last resort - may be a Plus Code
+                addr.thoroughfare,
+                addr.subLocality,
+                addr.locality,
+                addr.subAdminArea,
+                addr.featureName
             )
 
             candidates.firstOrNull { isUsableName(it) }
@@ -395,14 +433,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /**
-     * Fallback reverse geocoder using OpenWeatherMap's Geocoding API.
-     * Coarser than Geocoder (city/district level only, no street names)
-     * but tends to reliably return *something*, so it's used only when
-     * the Android geocoder comes back empty. Returns null on any
-     * failure (no key configured, no network, bad response, etc.)
-     * so the caller can fall back to "Stop N".
-     */
     private fun reverseGeocodeOWM(lat: Double, lon: Double): String? {
         val apiKey = BuildConfig.OWM_API_KEY
         if (apiKey.isBlank()) return null
@@ -440,8 +470,10 @@ class MainActivity : ComponentActivity() {
         return String.format(Locale.US, "%02d:%02d:%02d", h, m, s)
     }
 
+    // Default path: auto-saves into Downloads/gps_logs, now correctly
+    // using the user's typed filename (this was the actual bug).
     private fun createCsvFile(): OutputStream {
-        val fileName = "gps_log_${System.currentTimeMillis()}.csv"
+        val fileName = sanitizedFileName()
         currentFileName.value = fileName
 
         val values = ContentValues().apply {
