@@ -3,6 +3,7 @@ package com.deep.gpslogger
 import android.Manifest
 import android.content.ContentValues
 import android.content.pm.PackageManager
+import android.location.Geocoder
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
@@ -15,6 +16,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Button
@@ -35,6 +37,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.OutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -43,6 +46,7 @@ import java.util.Locale
 class MainActivity : ComponentActivity() {
 
     private lateinit var locationManager: LocationManager
+    private lateinit var geocoder: Geocoder
     private var outputStream: OutputStream? = null
 
     private var latestLocation: Location? = null
@@ -50,11 +54,18 @@ class MainActivity : ComponentActivity() {
     private val scope = CoroutineScope(Dispatchers.Main)
 
     private var isLogging = mutableStateOf(false)
+    private var isPaused = mutableStateOf(false)
     private var statusText = mutableStateOf("Not logging")
     private var selectedIntervalSeconds = mutableStateOf(10)
     private var rowCount = mutableStateOf(0)
 
     private val intervalOptions = listOf(5, 10, 30, 60)
+
+    // ---- Trip-tracking state (reset each time a new session starts) ----
+    private var previousLocation: Location? = null
+    private var cumulativeDistanceKm = 0.0
+    private var loggingStartTimeMillis = 0L
+    private var stopOrderCounter = 0
 
     private val locationListener = LocationListener { location ->
         latestLocation = location
@@ -77,6 +88,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         locationManager = getSystemService(LOCATION_SERVICE) as LocationManager
+        geocoder = Geocoder(this, Locale.getDefault())
 
         setContent {
             GPSLoggerTheme {
@@ -86,6 +98,7 @@ class MainActivity : ComponentActivity() {
                         verticalArrangement = Arrangement.Center
                     ) {
                         val logging by isLogging
+                        val paused by isPaused
                         val status by statusText
                         val interval by selectedIntervalSeconds
                         val count by rowCount
@@ -120,11 +133,16 @@ class MainActivity : ComponentActivity() {
                                 Text("Start Logging")
                             }
                         } else {
-                            Button(
-                                onClick = { stopLogging() },
-                                modifier = Modifier.padding(top = 24.dp)
-                            ) {
-                                Text("Stop Logging")
+                            Row(modifier = Modifier.padding(top = 24.dp)) {
+                                Button(onClick = { togglePause() }) {
+                                    Text(if (paused) "Resume" else "Pause")
+                                }
+                                Button(
+                                    onClick = { stopLogging() },
+                                    modifier = Modifier.padding(start = 12.dp)
+                                ) {
+                                    Text("Stop Logging")
+                                }
                             }
                         }
                     }
@@ -152,8 +170,14 @@ class MainActivity : ComponentActivity() {
             return
         }
 
-        // Seed with last known location so we have something to log
-        // immediately, instead of waiting for the first fresh GPS fix.
+        // Reset trip state for a fresh session
+        previousLocation = null
+        cumulativeDistanceKm = 0.0
+        stopOrderCounter = 0
+        loggingStartTimeMillis = System.currentTimeMillis()
+        isPaused.value = false
+
+        // Seed with last known location so we have something to log immediately
         latestLocation = try {
             locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)
                 ?: locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
@@ -163,13 +187,33 @@ class MainActivity : ComponentActivity() {
 
         try {
             outputStream = createCsvFile()
-            outputStream?.write("timestamp,latitude,longitude\n".toByteArray())
+            outputStream?.write("stop_order,stop_name,distance_km,time_elapsed,latitude,longitude\n".toByteArray())
             outputStream?.flush()
         } catch (e: Exception) {
             statusText.value = "Failed to create file: ${e.message}"
             return
         }
 
+        startLocationUpdates()
+
+        isLogging.value = true
+        rowCount.value = 0
+        statusText.value = "Logging every ${selectedIntervalSeconds.value}s..."
+
+        loggingJob = scope.launch {
+            // Write an initial row right away if we have any fix at all
+            latestLocation?.let { loc -> writeRow(loc) }
+
+            while (true) {
+                delay(selectedIntervalSeconds.value * 1000L)
+                if (!isPaused.value) {
+                    latestLocation?.let { loc -> writeRow(loc) }
+                }
+            }
+        }
+    }
+
+    private fun startLocationUpdates() {
         try {
             locationManager.requestLocationUpdates(
                 LocationManager.GPS_PROVIDER,
@@ -180,26 +224,23 @@ class MainActivity : ComponentActivity() {
             Log.d("GPSLogger", "Location updates requested successfully.")
         } catch (e: SecurityException) {
             statusText.value = "Permission error starting GPS."
-            return
         }
+    }
 
-        isLogging.value = true
-        rowCount.value = 0
-        statusText.value = "Logging every ${selectedIntervalSeconds.value}s..."
-
-        loggingJob = scope.launch {
-            // Write an initial row right away if we have any fix at all
-            // (seeded last-known or an early live update).
-            latestLocation?.let { loc ->
-                writeRow(loc.latitude, loc.longitude)
+    private fun togglePause() {
+        if (isPaused.value) {
+            // Resume
+            isPaused.value = false
+            startLocationUpdates()
+            statusText.value = "Logging every ${selectedIntervalSeconds.value}s..."
+        } else {
+            // Pause
+            isPaused.value = true
+            try {
+                locationManager.removeUpdates(locationListener)
+            } catch (_: Exception) {
             }
-
-            while (true) {
-                delay(selectedIntervalSeconds.value * 1000L)
-                latestLocation?.let { loc ->
-                    writeRow(loc.latitude, loc.longitude)
-                }
-            }
+            statusText.value = "Paused. ${rowCount.value} rows so far."
         }
     }
 
@@ -220,12 +261,28 @@ class MainActivity : ComponentActivity() {
         outputStream = null
 
         isLogging.value = false
+        isPaused.value = false
         statusText.value = "Stopped. Saved ${rowCount.value} rows."
     }
 
-    private fun writeRow(lat: Double, lon: Double) {
-        val timestamp = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US).format(Date())
-        val line = "$timestamp,$lat,$lon\n"
+    private suspend fun writeRow(loc: Location) {
+        stopOrderCounter += 1
+
+        val elapsedMillis = System.currentTimeMillis() - loggingStartTimeMillis
+        val elapsedFormatted = formatElapsed(elapsedMillis)
+
+        previousLocation?.let { prev ->
+            cumulativeDistanceKm += prev.distanceTo(loc) / 1000.0
+        }
+        previousLocation = loc
+
+        val stopName = withContext(Dispatchers.IO) { reverseGeocode(loc.latitude, loc.longitude) }
+        val distanceStr = String.format(Locale.US, "%.2f", cumulativeDistanceKm)
+
+        // Quote stop_name for CSV safety (it may contain commas)
+        val safeStopName = "\"" + stopName.replace("\"", "\"\"") + "\""
+
+        val line = "$stopOrderCounter,$safeStopName,$distanceStr,$elapsedFormatted,${loc.latitude},${loc.longitude}\n"
         try {
             outputStream?.write(line.toByteArray())
             outputStream?.flush()
@@ -233,6 +290,35 @@ class MainActivity : ComponentActivity() {
         } catch (e: Exception) {
             statusText.value = "Write error: ${e.message}"
         }
+    }
+
+    /**
+     * Reverse-geocodes a lat/lon into a short place name.
+     * Runs on Dispatchers.IO (blocking call) and falls back gracefully
+     * if geocoding is unavailable (no network, no Play services, etc.)
+     */
+    private fun reverseGeocode(lat: Double, lon: Double): String {
+        if (!Geocoder.isPresent()) return "Stop $stopOrderCounter"
+        return try {
+            @Suppress("DEPRECATION")
+            val addresses = geocoder.getFromLocation(lat, lon, 1)
+            val addr = addresses?.firstOrNull()
+            val name = addr?.featureName
+                ?: addr?.thoroughfare
+                ?: addr?.subLocality
+                ?: addr?.locality
+            if (!name.isNullOrBlank()) name else "Stop $stopOrderCounter"
+        } catch (e: Exception) {
+            "Stop $stopOrderCounter"
+        }
+    }
+
+    private fun formatElapsed(ms: Long): String {
+        val totalSec = ms / 1000
+        val h = totalSec / 3600
+        val m = (totalSec % 3600) / 60
+        val s = totalSec % 60
+        return String.format(Locale.US, "%02d:%02d:%02d", h, m, s)
     }
 
     private fun createCsvFile(): OutputStream {
