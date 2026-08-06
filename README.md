@@ -9,6 +9,8 @@
   ![Language](https://img.shields.io/badge/language-Kotlin-7F52FF?logo=kotlin&logoColor=white)
   ![UI](https://img.shields.io/badge/UI-Jetpack%20Compose-4285F4)
   ![License](https://img.shields.io/badge/license-MIT-lightgrey)
+
+  ### [⬇ Download latest APK (v1.0)](https://github.com/Deep-Saha1925/GPS_Logger/releases/latest)
 </div>
 
 ---
@@ -77,7 +79,7 @@ git clone https://github.com/Deep-Saha1925/GPS_Logger.git
 
 ## Installing the pre-built APK
 
-If you've been given a signed release APK directly rather than building from source:
+Grab the latest signed APK from the [**Releases page**](https://github.com/Deep-Saha1925/GPS_Logger/releases/latest) — no need to build from source.
 
 1. Download the `.apk` file to your phone
 2. Tap to open it — allow installation from that source when prompted
