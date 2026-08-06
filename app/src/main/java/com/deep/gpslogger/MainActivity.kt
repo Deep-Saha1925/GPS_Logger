@@ -38,6 +38,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.OutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -187,7 +188,7 @@ class MainActivity : ComponentActivity() {
 
         try {
             outputStream = createCsvFile()
-            outputStream?.write("stop_order,stop_name,distance_km,time_elapsed,latitude,longitude\n".toByteArray())
+            outputStream?.write("stop_order,stop_name,latitude,longitude,distance_km,time_elapsed\n".toByteArray())
             outputStream?.flush()
         } catch (e: Exception) {
             statusText.value = "Failed to create file: ${e.message}"
@@ -276,13 +277,18 @@ class MainActivity : ComponentActivity() {
         }
         previousLocation = loc
 
-        val stopName = withContext(Dispatchers.IO) { reverseGeocode(loc.latitude, loc.longitude) }
+        // Hard 2s timeout: a hung/slow network geocode call must never block
+        // the write loop. If it doesn't return in time, fall back immediately.
+        val stopName = withTimeoutOrNull(2000L) {
+            withContext(Dispatchers.IO) { reverseGeocode(loc.latitude, loc.longitude) }
+        } ?: "Stop $stopOrderCounter"
+
         val distanceStr = String.format(Locale.US, "%.2f", cumulativeDistanceKm)
 
         // Quote stop_name for CSV safety (it may contain commas)
         val safeStopName = "\"" + stopName.replace("\"", "\"\"") + "\""
 
-        val line = "$stopOrderCounter,$safeStopName,$distanceStr,$elapsedFormatted,${loc.latitude},${loc.longitude}\n"
+        val line = "$stopOrderCounter,$safeStopName,${loc.latitude},${loc.longitude},$distanceStr,$elapsedFormatted\n"
         try {
             outputStream?.write(line.toByteArray())
             outputStream?.flush()
