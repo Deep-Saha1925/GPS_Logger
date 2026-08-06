@@ -302,18 +302,36 @@ class MainActivity : ComponentActivity() {
      * Reverse-geocodes a lat/lon into a short place name.
      * Runs on Dispatchers.IO (blocking call) and falls back gracefully
      * if geocoding is unavailable (no network, no Play services, etc.)
+     *
+     * Note: Geocoder often returns a Plus Code (e.g. "FGJQ+Q96") in
+     * featureName when there's no named street/POI nearby (common in
+     * rural areas). We explicitly skip those and prefer real names.
      */
+    private val plusCodePattern = Regex("^[23456789CFGHJMPQRVWX]{4,8}\\+[23456789CFGHJMPQRVWX]{2,3}(\\s|$)")
+
+    private fun isUsableName(name: String?): Boolean {
+        if (name.isNullOrBlank()) return false
+        return !plusCodePattern.containsMatchIn(name)
+    }
+
     private fun reverseGeocode(lat: Double, lon: Double): String {
         if (!Geocoder.isPresent()) return "Stop $stopOrderCounter"
         return try {
             @Suppress("DEPRECATION")
             val addresses = geocoder.getFromLocation(lat, lon, 1)
-            val addr = addresses?.firstOrNull()
-            val name = addr?.featureName
-                ?: addr?.thoroughfare
-                ?: addr?.subLocality
-                ?: addr?.locality
-            if (!name.isNullOrBlank()) name else "Stop $stopOrderCounter"
+            val addr = addresses?.firstOrNull() ?: return "Stop $stopOrderCounter"
+
+            // Prefer real, human-readable names over featureName,
+            // since featureName is where Plus Codes usually show up.
+            val candidates = listOf(
+                addr.thoroughfare,      // street name
+                addr.subLocality,       // neighborhood
+                addr.locality,          // town/city
+                addr.subAdminArea,      // district
+                addr.featureName        // last resort - may be a Plus Code
+            )
+
+            candidates.firstOrNull { isUsableName(it) } ?: "Stop $stopOrderCounter"
         } catch (e: Exception) {
             "Stop $stopOrderCounter"
         }
