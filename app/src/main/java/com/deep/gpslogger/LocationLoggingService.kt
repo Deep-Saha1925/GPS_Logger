@@ -30,7 +30,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
-import java.io.OutputStream
+import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.Locale
@@ -39,17 +39,26 @@ import java.util.Locale
  * Runs GPS logging as a foreground service so it survives screen-off,
  * app-switching, and being swiped from Recents.
  *
- * Reliability notes (why these exist - see fixes below):
- *  - Holds a partial WakeLock for the entire logging session. Without this,
- *    the CPU sleeps during Doze mode and the write loop silently stalls even
- *    though the foreground notification is still showing.
- *  - The write loop is wrapped so a single unexpected exception can never
- *    silently kill logging forever - it's caught, logged, and the loop
- *    continues on the next tick instead of dying quietly.
- *  - Session details are persisted to SharedPreferences so that if Android
- *    kills the whole process and restarts the service via START_STICKY
- *    (which arrives with a null intent - no extras), we can recover and
- *    resume logging into the same file instead of doing nothing.
+ * Output format: a real .xlsx workbook (not CSV) matching the schema
+ * expected by the downstream route-upload backend:
+ *   stop_order (int), stop_name (text), latitude (number),
+ *   longitude (number), distance_km (number), slack_min (number)
+ *
+ * Since xlsx is a zip container, it can't be appended to like a text file -
+ * each new reading triggers a full regeneration of the workbook from the
+ * accumulated in-memory row list. At realistic polling intervals (5s+) over
+ * a multi-hour session this is a few thousand small rows at most, so
+ * regenerating the whole (tiny) file each time is cheap.
+ *
+ * Reliability notes:
+ *  - Holds a partial WakeLock for the entire logging session so the CPU
+ *    doesn't sleep mid-session during Doze mode.
+ *  - Every write is wrapped so a single unexpected exception can't silently
+ *    kill logging forever - it's caught, logged, and the loop continues.
+ *  - Row history is also mirrored to a small private-storage cache file, so
+ *    if Android kills the whole process and restarts the service via
+ *    START_STICKY, the accumulated rows can be reloaded and logging resumed
+ *    into the same output file instead of starting over or doing nothing.
  */
 class LocationLoggingService : Service() {
 
@@ -58,6 +67,9 @@ class LocationLoggingService : Service() {
         const val NOTIFICATION_ID = 1001
         private const val TAG = "GPSLoggerService"
         private const val PREFS_NAME = "gps_logger_session"
+        private const val CACHE_FILE_NAME = "gps_session_cache.tsv"
+
+        val HEADERS = listOf("stop_order", "stop_name", "latitude", "longitude", "distance_km", "slack_min")
 
         const val ACTION_START = "com.deep.gpslogger.action.START"
         const val ACTION_STOP = "com.deep.gpslogger.action.STOP"
@@ -72,17 +84,25 @@ class LocationLoggingService : Service() {
             private set
     }
 
+    data class RouteRow(
+        val stopOrder: Int,
+        val stopName: String,
+        val latitude: Double,
+        val longitude: Double,
+        val distanceKm: Double,
+        val slackMin: Double
+    )
+
     private lateinit var locationManager: LocationManager
     private lateinit var geocoder: Geocoder
-    private var outputStream: OutputStream? = null
     private var outputUri: Uri? = null
+
+    private val accumulatedRows = mutableListOf<RouteRow>()
 
     private var latestLocation: Location? = null
     private var loggingJob: Job? = null
 
     private val exceptionHandler = CoroutineExceptionHandler { _, throwable ->
-        // Last-resort net: if something still escapes the loop's own try/catch,
-        // log it and attempt to relaunch the loop rather than dying silently.
         Log.e(TAG, "Uncaught exception in logging scope, attempting to recover", throwable)
         if (isRunning) {
             relaunchLoopAfterCrash()
@@ -95,7 +115,7 @@ class LocationLoggingService : Service() {
     private var intervalSeconds = 10
     private var previousLocation: Location? = null
     private var cumulativeDistanceKm = 0.0
-    private var loggingStartTimeMillis = 0L
+    private var lastRowTimeMillis = 0L
     private var stopOrderCounter = 0
 
     private val locationListener = LocationListener { location ->
@@ -111,9 +131,6 @@ class LocationLoggingService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent == null) {
-            // Service was restarted by the system (START_STICKY) after the
-            // process was killed. All in-memory state is gone, but if a
-            // session was active we can recover using persisted details.
             Log.w(TAG, "Restarted with null intent - attempting recovery")
             attemptRecoveryAfterProcessDeath()
             return START_STICKY
@@ -130,30 +147,30 @@ class LocationLoggingService : Service() {
                     return START_STICKY
                 }
                 intervalSeconds = intent.getIntExtra(EXTRA_INTERVAL_SECONDS, 10)
-                val fileName = intent.getStringExtra(EXTRA_FILE_NAME) ?: "gps_log_${System.currentTimeMillis()}.csv"
+                val fileName = intent.getStringExtra(EXTRA_FILE_NAME) ?: "gps_log_${System.currentTimeMillis()}.xlsx"
                 val customUriStr = intent.getStringExtra(EXTRA_CUSTOM_URI)
 
                 startForeground(NOTIFICATION_ID, buildNotification("Starting..."))
 
-                val (uri, stream) = try {
+                val uri = try {
                     if (customUriStr != null) {
-                        val parsed = Uri.parse(customUriStr)
-                        parsed to contentResolver.openOutputStream(parsed, "wa")
+                        Uri.parse(customUriStr)
                     } else {
-                        createDefaultCsvFile(fileName)
+                        createDefaultXlsxFile(fileName)
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "Failed to open output stream", e)
-                    null to null
+                    Log.e(TAG, "Failed to create/resolve output file", e)
+                    null
                 }
 
-                if (stream == null || uri == null) {
+                if (uri == null) {
                     stopSelf()
                     return START_NOT_STICKY
                 }
 
+                clearCacheFile()
                 persistSession(intervalSeconds, uri)
-                beginLogging(stream, isResume = false)
+                beginLogging(uri, isResume = false)
             }
         }
         return START_STICKY
@@ -177,40 +194,33 @@ class LocationLoggingService : Service() {
             return
         }
 
-        // Must call startForeground promptly after any system-initiated restart.
         startForeground(NOTIFICATION_ID, buildNotification("Resuming logging..."))
 
         intervalSeconds = savedInterval
         val uri = Uri.parse(savedUriStr)
-        val stream = try {
-            contentResolver.openOutputStream(uri, "wa")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to reopen file during recovery", e)
-            null
-        }
 
-        if (stream == null) {
-            Log.e(TAG, "Recovery failed - could not reopen output stream")
-            clearPersistedSession()
-            stopSelf()
-            return
-        }
+        val restoredRows = loadRowsFromCache()
+        accumulatedRows.clear()
+        accumulatedRows.addAll(restoredRows)
+        stopOrderCounter = restoredRows.size
+        cumulativeDistanceKm = restoredRows.lastOrNull()?.distanceKm ?: 0.0
+        rowCount = restoredRows.size
 
-        Log.i(TAG, "Recovery succeeded, resuming logging without rewriting header")
-        beginLogging(stream, isResume = true, resumedUri = uri)
+        Log.i(TAG, "Recovery restored ${restoredRows.size} prior rows, resuming logging")
+        beginLogging(uri, isResume = true)
     }
 
-    private fun beginLogging(stream: OutputStream, isResume: Boolean, resumedUri: Uri? = null) {
-        outputStream = stream
-        outputUri = resumedUri ?: outputUri
+    private fun beginLogging(uri: Uri, isResume: Boolean) {
+        outputUri = uri
 
         if (!isResume) {
+            accumulatedRows.clear()
             previousLocation = null
             cumulativeDistanceKm = 0.0
             stopOrderCounter = 0
-            loggingStartTimeMillis = System.currentTimeMillis()
             rowCount = 0
         }
+        lastRowTimeMillis = System.currentTimeMillis()
         isRunning = true
 
         latestLocation = try {
@@ -218,15 +228,6 @@ class LocationLoggingService : Service() {
                 ?: locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
         } catch (e: SecurityException) {
             null
-        }
-
-        if (!isResume) {
-            try {
-                outputStream?.write("stop_order,stop_name,latitude,longitude,distance_km,time_elapsed\n".toByteArray())
-                outputStream?.flush()
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to write header", e)
-            }
         }
 
         acquireWakeLock()
@@ -248,11 +249,6 @@ class LocationLoggingService : Service() {
         }
     }
 
-    /**
-     * Every write is wrapped here so that any unexpected failure (a file
-     * write error, a geocoding hiccup, anything) is caught, logged, and the
-     * loop simply continues on the next interval - it never dies silently.
-     */
     private suspend fun safeWriteRow(loc: Location) {
         try {
             writeRow(loc)
@@ -275,7 +271,7 @@ class LocationLoggingService : Service() {
                 "GPSLogger:LoggingWakeLock"
             ).apply {
                 setReferenceCounted(false)
-                acquire() // held for the whole session; released in stopLoggingAndSelf/onDestroy
+                acquire()
             }
             Log.i(TAG, "Wake lock acquired")
         } catch (e: Exception) {
@@ -285,9 +281,7 @@ class LocationLoggingService : Service() {
 
     private fun releaseWakeLock() {
         try {
-            wakeLock?.let {
-                if (it.isHeld) it.release()
-            }
+            wakeLock?.let { if (it.isHeld) it.release() }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to release wake lock", e)
         }
@@ -308,8 +302,9 @@ class LocationLoggingService : Service() {
     private suspend fun writeRow(loc: Location) {
         stopOrderCounter += 1
 
-        val elapsedMillis = System.currentTimeMillis() - loggingStartTimeMillis
-        val elapsedFormatted = formatElapsed(elapsedMillis)
+        val now = System.currentTimeMillis()
+        val slackMin = (now - lastRowTimeMillis) / 60000.0
+        lastRowTimeMillis = now
 
         previousLocation?.let { prev ->
             cumulativeDistanceKm += prev.distanceTo(loc) / 1000.0
@@ -322,17 +317,80 @@ class LocationLoggingService : Service() {
             withContext(Dispatchers.IO) { reverseGeocodeOWM(loc.latitude, loc.longitude) }
         } ?: "Stop $stopOrderCounter"
 
-        val distanceStr = String.format(Locale.US, "%.2f", cumulativeDistanceKm)
-        val safeStopName = "\"" + stopName.replace("\"", "\"\"") + "\""
+        val row = RouteRow(
+            stopOrder = stopOrderCounter,
+            stopName = stopName,
+            latitude = loc.latitude,
+            longitude = loc.longitude,
+            distanceKm = Math.round(cumulativeDistanceKm * 100.0) / 100.0,
+            slackMin = Math.round(slackMin * 100.0) / 100.0
+        )
+        accumulatedRows.add(row)
+        appendRowToCache(row)
 
-        val line = "$stopOrderCounter,$safeStopName,${loc.latitude},${loc.longitude},$distanceStr,$elapsedFormatted\n"
         try {
-            outputStream?.write(line.toByteArray())
-            outputStream?.flush()
-            rowCount += 1
+            regenerateXlsxFile()
+            rowCount = accumulatedRows.size
             updateNotification("Logging every ${intervalSeconds}s... ($rowCount rows)")
         } catch (e: Exception) {
-            Log.e(TAG, "Write error", e)
+            Log.e(TAG, "Failed to write xlsx file", e)
+        }
+    }
+
+    private fun regenerateXlsxFile() {
+        val uri = outputUri ?: return
+        val rowsAsAny: List<List<Any?>> = accumulatedRows.map { r ->
+            listOf(r.stopOrder, r.stopName, r.latitude, r.longitude, r.distanceKm, r.slackMin)
+        }
+        contentResolver.openOutputStream(uri, "wt")?.use { stream ->
+            XlsxWriter.write(stream, HEADERS, rowsAsAny)
+        } ?: throw Exception("Could not open output stream for xlsx write")
+    }
+
+    // --- Private-storage row cache, used only to survive a process kill+restart ---
+
+    private fun cacheFile(): File = File(filesDir, CACHE_FILE_NAME)
+
+    private fun clearCacheFile() {
+        try {
+            cacheFile().delete()
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun appendRowToCache(row: RouteRow) {
+        try {
+            cacheFile().appendText(
+                "${row.stopOrder}\t${row.stopName.replace("\t", " ")}\t${row.latitude}\t${row.longitude}\t${row.distanceKm}\t${row.slackMin}\n"
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to write row cache", e)
+        }
+    }
+
+    private fun loadRowsFromCache(): List<RouteRow> {
+        val file = cacheFile()
+        if (!file.exists()) return emptyList()
+        return try {
+            file.readLines().mapNotNull { line ->
+                val parts = line.split("\t")
+                if (parts.size != 6) return@mapNotNull null
+                try {
+                    RouteRow(
+                        stopOrder = parts[0].toInt(),
+                        stopName = parts[1],
+                        latitude = parts[2].toDouble(),
+                        longitude = parts[3].toDouble(),
+                        distanceKm = parts[4].toDouble(),
+                        slackMin = parts[5].toDouble()
+                    )
+                } catch (e: Exception) {
+                    null
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to read row cache", e)
+            emptyList()
         }
     }
 
@@ -382,25 +440,24 @@ class LocationLoggingService : Service() {
         }
     }
 
-    private fun formatElapsed(ms: Long): String {
-        val totalSec = ms / 1000
-        val h = totalSec / 3600
-        val m = (totalSec % 3600) / 60
-        val s = totalSec % 60
-        return String.format(Locale.US, "%02d:%02d:%02d", h, m, s)
-    }
-
-    private fun createDefaultCsvFile(fileName: String): Pair<Uri, OutputStream> {
+    private fun createDefaultXlsxFile(fileName: String): Uri {
         val values = ContentValues().apply {
             put(MediaStore.Downloads.DISPLAY_NAME, fileName)
-            put(MediaStore.Downloads.MIME_TYPE, "text/csv")
+            put(
+                MediaStore.Downloads.MIME_TYPE,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
             put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/gps_logs")
         }
         val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
             ?: throw Exception("Could not create file in Downloads")
-        val stream = contentResolver.openOutputStream(uri, "wa")
-            ?: throw Exception("Could not open output stream")
-        return uri to stream
+
+        // Write an empty (header-only) workbook immediately so the file is
+        // valid the instant it's created, even before the first GPS row lands.
+        contentResolver.openOutputStream(uri, "wt")?.use { stream ->
+            XlsxWriter.write(stream, HEADERS, emptyList())
+        }
+        return uri
     }
 
     private fun persistSession(interval: Int, uri: Uri) {
@@ -424,14 +481,9 @@ class LocationLoggingService : Service() {
             locationManager.removeUpdates(locationListener)
         } catch (_: Exception) {
         }
-        try {
-            outputStream?.flush()
-            outputStream?.close()
-        } catch (_: Exception) {
-        }
-        outputStream = null
         releaseWakeLock()
         clearPersistedSession()
+        clearCacheFile()
         isRunning = false
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -477,26 +529,16 @@ class LocationLoggingService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         if (isRunning) {
-            // onDestroy while still "running" means this wasn't an explicit
-            // user Stop (that path already calls stopLoggingAndSelf, which
-            // sets isRunning = false first). This is the system killing us -
-            // clean up local resources but deliberately KEEP the persisted
-            // session so attemptRecoveryAfterProcessDeath() can resume
-            // logging into the same file if the system restarts us.
             loggingJob?.cancel()
             loggingJob = null
             try {
                 locationManager.removeUpdates(locationListener)
             } catch (_: Exception) {
             }
-            try {
-                outputStream?.flush()
-                outputStream?.close()
-            } catch (_: Exception) {
-            }
-            outputStream = null
             releaseWakeLock()
             isRunning = false
+            // Deliberately keep persisted session + cache file so recovery
+            // can resume if the system restarts this service.
         } else {
             releaseWakeLock()
         }
