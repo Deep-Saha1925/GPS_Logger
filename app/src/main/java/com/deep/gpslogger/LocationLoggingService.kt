@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.ContentValues
+import android.content.Context
 import android.content.Intent
 import android.location.Geocoder
 import android.location.Location
@@ -15,12 +16,15 @@ import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.os.IBinder
+import android.os.PowerManager
 import android.provider.MediaStore
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -31,11 +35,29 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.util.Locale
 
+/**
+ * Runs GPS logging as a foreground service so it survives screen-off,
+ * app-switching, and being swiped from Recents.
+ *
+ * Reliability notes (why these exist - see fixes below):
+ *  - Holds a partial WakeLock for the entire logging session. Without this,
+ *    the CPU sleeps during Doze mode and the write loop silently stalls even
+ *    though the foreground notification is still showing.
+ *  - The write loop is wrapped so a single unexpected exception can never
+ *    silently kill logging forever - it's caught, logged, and the loop
+ *    continues on the next tick instead of dying quietly.
+ *  - Session details are persisted to SharedPreferences so that if Android
+ *    kills the whole process and restarts the service via START_STICKY
+ *    (which arrives with a null intent - no extras), we can recover and
+ *    resume logging into the same file instead of doing nothing.
+ */
 class LocationLoggingService : Service() {
 
     companion object {
         const val CHANNEL_ID = "gps_logger_channel"
         const val NOTIFICATION_ID = 1001
+        private const val TAG = "GPSLoggerService"
+        private const val PREFS_NAME = "gps_logger_session"
 
         const val ACTION_START = "com.deep.gpslogger.action.START"
         const val ACTION_STOP = "com.deep.gpslogger.action.STOP"
@@ -44,7 +66,6 @@ class LocationLoggingService : Service() {
         const val EXTRA_FILE_NAME = "file_name"
         const val EXTRA_CUSTOM_URI = "custom_uri" // nullable string form of a Uri
 
-        // Simple broadcast-free status channel other components can read
         var isRunning = false
             private set
         var rowCount = 0
@@ -54,10 +75,22 @@ class LocationLoggingService : Service() {
     private lateinit var locationManager: LocationManager
     private lateinit var geocoder: Geocoder
     private var outputStream: OutputStream? = null
+    private var outputUri: Uri? = null
 
     private var latestLocation: Location? = null
     private var loggingJob: Job? = null
-    private val scope = CoroutineScope(Dispatchers.Default + Job())
+
+    private val exceptionHandler = CoroutineExceptionHandler { _, throwable ->
+        // Last-resort net: if something still escapes the loop's own try/catch,
+        // log it and attempt to relaunch the loop rather than dying silently.
+        Log.e(TAG, "Uncaught exception in logging scope, attempting to recover", throwable)
+        if (isRunning) {
+            relaunchLoopAfterCrash()
+        }
+    }
+    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob() + exceptionHandler)
+
+    private var wakeLock: PowerManager.WakeLock? = null
 
     private var intervalSeconds = 10
     private var previousLocation: Location? = null
@@ -77,16 +110,23 @@ class LocationLoggingService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
+        if (intent == null) {
+            // Service was restarted by the system (START_STICKY) after the
+            // process was killed. All in-memory state is gone, but if a
+            // session was active we can recover using persisted details.
+            Log.w(TAG, "Restarted with null intent - attempting recovery")
+            attemptRecoveryAfterProcessDeath()
+            return START_STICKY
+        }
+
+        when (intent.action) {
             ACTION_STOP -> {
                 stopLoggingAndSelf()
                 return START_NOT_STICKY
             }
             ACTION_START -> {
                 if (isRunning) {
-                    // Already logging - ignore duplicate start requests instead
-                    // of spawning a second write loop / output stream.
-                    Log.w("GPSLoggerService", "Ignored duplicate ACTION_START while already running")
+                    Log.w(TAG, "Ignored duplicate ACTION_START while already running")
                     return START_STICKY
                 }
                 intervalSeconds = intent.getIntExtra(EXTRA_INTERVAL_SECONDS, 10)
@@ -95,38 +135,82 @@ class LocationLoggingService : Service() {
 
                 startForeground(NOTIFICATION_ID, buildNotification("Starting..."))
 
-                val stream = try {
+                val (uri, stream) = try {
                     if (customUriStr != null) {
-                        contentResolver.openOutputStream(Uri.parse(customUriStr))
+                        val parsed = Uri.parse(customUriStr)
+                        parsed to contentResolver.openOutputStream(parsed, "wa")
                     } else {
                         createDefaultCsvFile(fileName)
                     }
                 } catch (e: Exception) {
-                    Log.e("GPSLoggerService", "Failed to open output stream", e)
-                    null
+                    Log.e(TAG, "Failed to open output stream", e)
+                    null to null
                 }
 
-                if (stream == null) {
+                if (stream == null || uri == null) {
                     stopSelf()
                     return START_NOT_STICKY
                 }
 
-                beginLogging(stream)
+                persistSession(intervalSeconds, uri)
+                beginLogging(stream, isResume = false)
             }
         }
-        // START_STICKY: if Android kills the service due to memory pressure,
-        // it will try to recreate it (without the original intent extras though,
-        // which is a known platform limitation - see note below).
         return START_STICKY
     }
 
-    private fun beginLogging(stream: OutputStream) {
+    private fun attemptRecoveryAfterProcessDeath() {
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val wasActive = prefs.getBoolean("session_active", false)
+        if (!wasActive) {
+            stopSelf()
+            return
+        }
+
+        val savedInterval = prefs.getInt("interval_seconds", 10)
+        val savedUriStr = prefs.getString("output_uri", null)
+
+        if (savedUriStr == null) {
+            Log.w(TAG, "No persisted URI to recover session, giving up")
+            clearPersistedSession()
+            stopSelf()
+            return
+        }
+
+        // Must call startForeground promptly after any system-initiated restart.
+        startForeground(NOTIFICATION_ID, buildNotification("Resuming logging..."))
+
+        intervalSeconds = savedInterval
+        val uri = Uri.parse(savedUriStr)
+        val stream = try {
+            contentResolver.openOutputStream(uri, "wa")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to reopen file during recovery", e)
+            null
+        }
+
+        if (stream == null) {
+            Log.e(TAG, "Recovery failed - could not reopen output stream")
+            clearPersistedSession()
+            stopSelf()
+            return
+        }
+
+        Log.i(TAG, "Recovery succeeded, resuming logging without rewriting header")
+        beginLogging(stream, isResume = true, resumedUri = uri)
+    }
+
+    private fun beginLogging(stream: OutputStream, isResume: Boolean, resumedUri: Uri? = null) {
         outputStream = stream
-        previousLocation = null
-        cumulativeDistanceKm = 0.0
-        stopOrderCounter = 0
-        loggingStartTimeMillis = System.currentTimeMillis()
-        rowCount = 0
+        outputUri = resumedUri ?: outputUri
+
+        if (!isResume) {
+            previousLocation = null
+            cumulativeDistanceKm = 0.0
+            stopOrderCounter = 0
+            loggingStartTimeMillis = System.currentTimeMillis()
+            rowCount = 0
+        }
         isRunning = true
 
         latestLocation = try {
@@ -136,23 +220,78 @@ class LocationLoggingService : Service() {
             null
         }
 
-        try {
-            outputStream?.write("stop_order,stop_name,latitude,longitude,distance_km,time_elapsed\n".toByteArray())
-            outputStream?.flush()
-        } catch (e: Exception) {
-            Log.e("GPSLoggerService", "Failed to write header", e)
-        }
-
-        startLocationUpdates()
-        updateNotification("Logging every ${intervalSeconds}s...")
-
-        loggingJob = scope.launch {
-            latestLocation?.let { loc -> writeRow(loc) }
-            while (true) {
-                delay(intervalSeconds * 1000L)
-                latestLocation?.let { loc -> writeRow(loc) }
+        if (!isResume) {
+            try {
+                outputStream?.write("stop_order,stop_name,latitude,longitude,distance_km,time_elapsed\n".toByteArray())
+                outputStream?.flush()
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to write header", e)
             }
         }
+
+        acquireWakeLock()
+        startLocationUpdates()
+        updateNotification("Logging every ${intervalSeconds}s...")
+        launchLoggingLoop()
+    }
+
+    private fun launchLoggingLoop() {
+        loggingJob?.cancel()
+        loggingJob = scope.launch {
+            latestLocation?.let { loc -> safeWriteRow(loc) }
+            while (isRunning) {
+                delay(intervalSeconds * 1000L)
+                if (isRunning) {
+                    latestLocation?.let { loc -> safeWriteRow(loc) }
+                }
+            }
+        }
+    }
+
+    /**
+     * Every write is wrapped here so that any unexpected failure (a file
+     * write error, a geocoding hiccup, anything) is caught, logged, and the
+     * loop simply continues on the next interval - it never dies silently.
+     */
+    private suspend fun safeWriteRow(loc: Location) {
+        try {
+            writeRow(loc)
+        } catch (e: Exception) {
+            Log.e(TAG, "Row write failed, continuing to next interval", e)
+        }
+    }
+
+    private fun relaunchLoopAfterCrash() {
+        Log.w(TAG, "Relaunching logging loop after unexpected crash")
+        launchLoggingLoop()
+    }
+
+    private fun acquireWakeLock() {
+        if (wakeLock?.isHeld == true) return
+        try {
+            val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = powerManager.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                "GPSLogger:LoggingWakeLock"
+            ).apply {
+                setReferenceCounted(false)
+                acquire() // held for the whole session; released in stopLoggingAndSelf/onDestroy
+            }
+            Log.i(TAG, "Wake lock acquired")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to acquire wake lock", e)
+        }
+    }
+
+    private fun releaseWakeLock() {
+        try {
+            wakeLock?.let {
+                if (it.isHeld) it.release()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to release wake lock", e)
+        }
+        wakeLock = null
     }
 
     private fun startLocationUpdates() {
@@ -161,7 +300,7 @@ class LocationLoggingService : Service() {
             try {
                 locationManager.requestLocationUpdates(provider, 1000L, 0f, locationListener)
             } catch (e: SecurityException) {
-                Log.e("GPSLoggerService", "No permission for $provider", e)
+                Log.e(TAG, "No permission for $provider", e)
             }
         }
     }
@@ -193,7 +332,7 @@ class LocationLoggingService : Service() {
             rowCount += 1
             updateNotification("Logging every ${intervalSeconds}s... ($rowCount rows)")
         } catch (e: Exception) {
-            Log.e("GPSLoggerService", "Write error", e)
+            Log.e(TAG, "Write error", e)
         }
     }
 
@@ -251,7 +390,7 @@ class LocationLoggingService : Service() {
         return String.format(Locale.US, "%02d:%02d:%02d", h, m, s)
     }
 
-    private fun createDefaultCsvFile(fileName: String): OutputStream {
+    private fun createDefaultCsvFile(fileName: String): Pair<Uri, OutputStream> {
         val values = ContentValues().apply {
             put(MediaStore.Downloads.DISPLAY_NAME, fileName)
             put(MediaStore.Downloads.MIME_TYPE, "text/csv")
@@ -259,7 +398,23 @@ class LocationLoggingService : Service() {
         }
         val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
             ?: throw Exception("Could not create file in Downloads")
-        return contentResolver.openOutputStream(uri) ?: throw Exception("Could not open output stream")
+        val stream = contentResolver.openOutputStream(uri, "wa")
+            ?: throw Exception("Could not open output stream")
+        return uri to stream
+    }
+
+    private fun persistSession(interval: Int, uri: Uri) {
+        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+            .putBoolean("session_active", true)
+            .putInt("interval_seconds", interval)
+            .putString("output_uri", uri.toString())
+            .apply()
+    }
+
+    private fun clearPersistedSession() {
+        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+            .clear()
+            .apply()
     }
 
     private fun stopLoggingAndSelf() {
@@ -275,6 +430,8 @@ class LocationLoggingService : Service() {
         } catch (_: Exception) {
         }
         outputStream = null
+        releaseWakeLock()
+        clearPersistedSession()
         isRunning = false
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -319,7 +476,30 @@ class LocationLoggingService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
-        stopLoggingAndSelf()
+        if (isRunning) {
+            // onDestroy while still "running" means this wasn't an explicit
+            // user Stop (that path already calls stopLoggingAndSelf, which
+            // sets isRunning = false first). This is the system killing us -
+            // clean up local resources but deliberately KEEP the persisted
+            // session so attemptRecoveryAfterProcessDeath() can resume
+            // logging into the same file if the system restarts us.
+            loggingJob?.cancel()
+            loggingJob = null
+            try {
+                locationManager.removeUpdates(locationListener)
+            } catch (_: Exception) {
+            }
+            try {
+                outputStream?.flush()
+                outputStream?.close()
+            } catch (_: Exception) {
+            }
+            outputStream = null
+            releaseWakeLock()
+            isRunning = false
+        } else {
+            releaseWakeLock()
+        }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
