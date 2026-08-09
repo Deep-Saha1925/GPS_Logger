@@ -63,7 +63,11 @@ class MainActivity : ComponentActivity() {
         }
 
     private val createDocumentLauncher =
-        registerForActivityResult(ActivityResultContracts.CreateDocument("text/csv")) { uri ->
+        registerForActivityResult(
+            ActivityResultContracts.CreateDocument(
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+        ) { uri ->
             if (uri != null) {
                 // Without this, the write grant on a user-picked file can be
                 // lost once the picking Activity's transaction ends - which
@@ -110,9 +114,9 @@ class MainActivity : ComponentActivity() {
         val rawName = userFileNameInput.value.trim()
         return if (rawName.isNotBlank()) {
             val sanitized = rawName.replace(Regex("[^A-Za-z0-9_\\-]"), "_")
-            if (sanitized.endsWith(".csv", ignoreCase = true)) sanitized else "$sanitized.csv"
+            if (sanitized.endsWith(".xlsx", ignoreCase = true)) sanitized else "$sanitized.xlsx"
         } else {
-            "gps_log_${System.currentTimeMillis()}.csv"
+            "gps_log_${System.currentTimeMillis()}.xlsx"
         }
     }
 
