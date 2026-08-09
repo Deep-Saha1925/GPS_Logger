@@ -1,11 +1,15 @@
 package com.deep.gpslogger
 
 import android.Manifest
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.location.LocationManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -61,11 +65,46 @@ class MainActivity : ComponentActivity() {
     private val createDocumentLauncher =
         registerForActivityResult(ActivityResultContracts.CreateDocument("text/csv")) { uri ->
             if (uri != null) {
+                // Without this, the write grant on a user-picked file can be
+                // lost once the picking Activity's transaction ends - which
+                // would break reopening the file later (e.g. after a
+                // process-death recovery in the service).
+                try {
+                    contentResolver.takePersistableUriPermission(
+                        uri,
+                        Intent.FLAG_GRANT_WRITE_URI_PERMISSION or Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    )
+                } catch (e: SecurityException) {
+                    // Some providers don't support persistable grants; logging
+                    // will still work for this session, just not survive a
+                    // full process kill+restart for a custom save location.
+                }
                 startServiceWithUri(uri.toString())
             } else {
                 statusText.value = "File selection cancelled."
             }
         }
+
+    private fun isIgnoringBatteryOptimizations(): Boolean {
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        return powerManager.isIgnoringBatteryOptimizations(packageName)
+    }
+
+    private fun requestIgnoreBatteryOptimizations() {
+        try {
+            val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                data = Uri.parse("package:$packageName")
+            }
+            startActivity(intent)
+        } catch (e: Exception) {
+            // Some OEM builds (and some Android versions) reject this intent -
+            // fall back to the general battery settings screen instead.
+            try {
+                startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+            } catch (_: Exception) {
+            }
+        }
+    }
 
     private fun sanitizedFileName(): String {
         val rawName = userFileNameInput.value.trim()
@@ -101,6 +140,20 @@ class MainActivity : ComponentActivity() {
                             text = "Logging runs in the background via a notification.",
                             modifier = Modifier.padding(top = 8.dp)
                         )
+
+                        if (!logging && !isIgnoringBatteryOptimizations()) {
+                            Text(
+                                text = "For long sessions, disable battery optimization for this app - " +
+                                        "otherwise the phone may pause logging after a while.",
+                                modifier = Modifier.padding(top = 12.dp)
+                            )
+                            Button(
+                                onClick = { requestIgnoreBatteryOptimizations() },
+                                modifier = Modifier.padding(top = 8.dp)
+                            ) {
+                                Text("Disable Battery Optimization")
+                            }
+                        }
 
                         if (!logging) {
                             OutlinedTextField(
