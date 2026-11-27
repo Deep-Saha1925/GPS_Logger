@@ -25,6 +25,11 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -50,6 +55,12 @@ import java.util.Locale
  * a multi-hour session this is a few thousand small rows at most, so
  * regenerating the whole (tiny) file each time is cheap.
  *
+ * Two modes share the same file format and saving pipeline:
+ *  - AUTO   (default): a row is logged every N seconds.
+ *  - MANUAL: GPS is kept warm but nothing is logged on a timer; a row is
+ *    logged only when the user taps LOG CURRENT LOC and names the spot
+ *    (ACTION_LOG_MANUAL). stop_name is the name the user typed.
+ *
  * Reliability notes:
  *  - Holds a partial WakeLock for the entire logging session so the CPU
  *    doesn't sleep mid-session during Doze mode.
@@ -73,15 +84,25 @@ class LocationLoggingService : Service() {
 
         const val ACTION_START = "com.deep.gpslogger.action.START"
         const val ACTION_STOP = "com.deep.gpslogger.action.STOP"
+        const val ACTION_LOG_MANUAL = "com.deep.gpslogger.action.LOG_MANUAL"
 
         const val EXTRA_INTERVAL_SECONDS = "interval_seconds"
         const val EXTRA_FILE_NAME = "file_name"
         const val EXTRA_CUSTOM_URI = "custom_uri" // nullable string form of a Uri
+        const val EXTRA_MANUAL_MODE = "manual_mode"
+        const val EXTRA_STOP_NAME = "stop_name"
 
         var isRunning = false
             private set
         var rowCount = 0
             private set
+        var isManualMode = false
+            private set
+
+        private val _manualFeedback = MutableStateFlow("")
+
+        /** Latest result message of a LOG CURRENT LOC tap, shown by the UI. */
+        val manualFeedback: StateFlow<String> = _manualFeedback.asStateFlow()
     }
 
     data class RouteRow(
@@ -104,13 +125,17 @@ class LocationLoggingService : Service() {
 
     private val exceptionHandler = CoroutineExceptionHandler { _, throwable ->
         Log.e(TAG, "Uncaught exception in logging scope, attempting to recover", throwable)
-        if (isRunning) {
+        if (isRunning && !isManualMode) {
             relaunchLoopAfterCrash()
         }
     }
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob() + exceptionHandler)
 
     private var wakeLock: PowerManager.WakeLock? = null
+
+    // Serialises row writes so an auto tick and a manual tap (or two quick
+    // manual taps) can never interleave and corrupt the counters/file.
+    private val writeMutex = Mutex()
 
     private var intervalSeconds = 10
     private var previousLocation: Location? = null
@@ -141,12 +166,21 @@ class LocationLoggingService : Service() {
                 stopLoggingAndSelf()
                 return START_NOT_STICKY
             }
+            ACTION_LOG_MANUAL -> {
+                if (isRunning && isManualMode) {
+                    handleManualLog(intent.getStringExtra(EXTRA_STOP_NAME).orEmpty())
+                } else {
+                    _manualFeedback.value = "Manual logging session is not running."
+                }
+                return START_STICKY
+            }
             ACTION_START -> {
                 if (isRunning) {
                     Log.w(TAG, "Ignored duplicate ACTION_START while already running")
                     return START_STICKY
                 }
                 intervalSeconds = intent.getIntExtra(EXTRA_INTERVAL_SECONDS, 10)
+                val manual = intent.getBooleanExtra(EXTRA_MANUAL_MODE, false)
                 val fileName = intent.getStringExtra(EXTRA_FILE_NAME) ?: "gps_log_${System.currentTimeMillis()}.xlsx"
                 val customUriStr = intent.getStringExtra(EXTRA_CUSTOM_URI)
 
@@ -169,8 +203,8 @@ class LocationLoggingService : Service() {
                 }
 
                 clearCacheFile()
-                persistSession(intervalSeconds, uri)
-                beginLogging(uri, isResume = false)
+                persistSession(intervalSeconds, uri, manual)
+                beginLogging(uri, isResume = false, manual = manual)
             }
         }
         return START_STICKY
@@ -186,6 +220,7 @@ class LocationLoggingService : Service() {
 
         val savedInterval = prefs.getInt("interval_seconds", 10)
         val savedUriStr = prefs.getString("output_uri", null)
+        val savedManual = prefs.getBoolean("manual_mode", false)
 
         if (savedUriStr == null) {
             Log.w(TAG, "No persisted URI to recover session, giving up")
@@ -207,11 +242,13 @@ class LocationLoggingService : Service() {
         rowCount = restoredRows.size
 
         Log.i(TAG, "Recovery restored ${restoredRows.size} prior rows, resuming logging")
-        beginLogging(uri, isResume = true)
+        beginLogging(uri, isResume = true, manual = savedManual)
     }
 
-    private fun beginLogging(uri: Uri, isResume: Boolean) {
+    private fun beginLogging(uri: Uri, isResume: Boolean, manual: Boolean) {
         outputUri = uri
+        isManualMode = manual
+        _manualFeedback.value = ""
 
         if (!isResume) {
             accumulatedRows.clear()
@@ -232,8 +269,46 @@ class LocationLoggingService : Service() {
 
         acquireWakeLock()
         startLocationUpdates()
-        updateNotification("Logging every ${intervalSeconds}s...")
-        launchLoggingLoop()
+        if (manual) {
+            updateNotification(manualNotificationText())
+        } else {
+            updateNotification("Logging every ${intervalSeconds}s...")
+            launchLoggingLoop()
+        }
+    }
+
+    private fun manualNotificationText(): String =
+        "Manual mode - tap LOG CURRENT LOC in the app ($rowCount points)"
+
+    /**
+     * MANUAL mode: logs the current position under the name the user typed.
+     * Uses the same row pipeline (distance, slack, xlsx, cache) as auto mode.
+     */
+    private fun handleManualLog(rawName: String) {
+        val loc = latestLocation
+        if (loc == null) {
+            _manualFeedback.value = "No GPS fix yet - wait a few seconds and try again."
+            return
+        }
+        val name = rawName.replace(Regex("[\\t\\r\\n]+"), " ").trim().take(100)
+        scope.launch {
+            try {
+                val (saved, label) = writeMutex.withLock {
+                    val ok = writeRow(loc, name.ifBlank { null })
+                    ok to accumulatedRows.last().stopName
+                }
+                val ageSec = (android.os.SystemClock.elapsedRealtimeNanos() - loc.elapsedRealtimeNanos) / 1_000_000_000L
+                _manualFeedback.value = if (saved) {
+                    "Logged #$rowCount: $label" +
+                            if (ageSec > 30) " (GPS fix is ${ageSec}s old)" else ""
+                } else {
+                    "Could not save to file - point kept in memory, will retry on next log."
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Manual log failed", e)
+                _manualFeedback.value = "Logging failed: ${e.message}"
+            }
+        }
     }
 
     private fun launchLoggingLoop() {
@@ -251,7 +326,7 @@ class LocationLoggingService : Service() {
 
     private suspend fun safeWriteRow(loc: Location) {
         try {
-            writeRow(loc)
+            writeMutex.withLock { writeRow(loc) }
         } catch (e: Exception) {
             Log.e(TAG, "Row write failed, continuing to next interval", e)
         }
@@ -299,7 +374,8 @@ class LocationLoggingService : Service() {
         }
     }
 
-    private suspend fun writeRow(loc: Location) {
+    /** Returns true if the xlsx file was rewritten successfully. */
+    private suspend fun writeRow(loc: Location, customName: String? = null): Boolean {
         stopOrderCounter += 1
 
         val now = System.currentTimeMillis()
@@ -311,7 +387,7 @@ class LocationLoggingService : Service() {
         }
         previousLocation = loc
 
-        val stopName = withTimeoutOrNull(2000L) {
+        val stopName = customName ?: withTimeoutOrNull(2000L) {
             withContext(Dispatchers.IO) { reverseGeocodeAndroid(loc.latitude, loc.longitude) }
         } ?: withTimeoutOrNull(2000L) {
             withContext(Dispatchers.IO) { reverseGeocodeOWM(loc.latitude, loc.longitude) }
@@ -331,9 +407,15 @@ class LocationLoggingService : Service() {
         try {
             regenerateXlsxFile()
             rowCount = accumulatedRows.size
-            updateNotification("Logging every ${intervalSeconds}s... ($rowCount rows)")
+            updateNotification(
+                if (isManualMode) manualNotificationText()
+                else "Logging every ${intervalSeconds}s... ($rowCount rows)"
+            )
+            return true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to write xlsx file", e)
+            rowCount = accumulatedRows.size
+            return false
         }
     }
 
@@ -460,9 +542,10 @@ class LocationLoggingService : Service() {
         return uri
     }
 
-    private fun persistSession(interval: Int, uri: Uri) {
+    private fun persistSession(interval: Int, uri: Uri, manual: Boolean) {
         getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
             .putBoolean("session_active", true)
+            .putBoolean("manual_mode", manual)
             .putInt("interval_seconds", interval)
             .putString("output_uri", uri.toString())
             .apply()
@@ -485,6 +568,7 @@ class LocationLoggingService : Service() {
         clearPersistedSession()
         clearCacheFile()
         isRunning = false
+        isManualMode = false
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
