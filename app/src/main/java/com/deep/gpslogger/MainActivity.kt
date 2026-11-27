@@ -19,12 +19,16 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Button
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -43,6 +47,9 @@ class MainActivity : ComponentActivity() {
     private var selectedIntervalSeconds = mutableStateOf(10)
     private var userFileNameInput = mutableStateOf("")
     private var useCustomLocation = mutableStateOf(false)
+    private var manualMode = mutableStateOf(false)
+    private var showNameDialog = mutableStateOf(false)
+    private var manualNameInput = mutableStateOf("")
 
     private val intervalOptions = listOf(5, 10, 30, 60)
 
@@ -136,8 +143,14 @@ class MainActivity : ComponentActivity() {
                         val interval by selectedIntervalSeconds
                         val fileNameInput by userFileNameInput
                         val customLocation by useCustomLocation
+                        val manual by manualMode
+                        val nameDialogOpen by showNameDialog
+                        val manualName by manualNameInput
+                        val manualFeedback by LocationLoggingService.manualFeedback.collectAsState()
 
                         var expanded by remember { mutableStateOf(false) }
+
+
 
                         Text(text = status)
                         Text(
@@ -160,6 +173,19 @@ class MainActivity : ComponentActivity() {
                         }
 
                         if (!logging) {
+                            Row(modifier = Modifier.padding(top = 16.dp)) {
+                                RadioButton(selected = !manual, onClick = { manualMode.value = false })
+                                Text(
+                                    text = "Auto (every ${interval}s)",
+                                    modifier = Modifier.padding(start = 4.dp, end = 16.dp, top = 12.dp)
+                                )
+                                RadioButton(selected = manual, onClick = { manualMode.value = true })
+                                Text(
+                                    text = "Manual",
+                                    modifier = Modifier.padding(start = 4.dp, top = 12.dp)
+                                )
+                            }
+
                             OutlinedTextField(
                                 value = fileNameInput,
                                 onValueChange = { userFileNameInput.value = it },
@@ -180,20 +206,37 @@ class MainActivity : ComponentActivity() {
                             }
                         }
 
-                        Text(text = "Polling interval: ${interval}s", modifier = Modifier.padding(top = 24.dp))
+                        if (!manual) {
+                            Text(text = "Polling interval: ${interval}s", modifier = Modifier.padding(top = 24.dp))
 
-                        Button(onClick = { expanded = true }, modifier = Modifier.padding(top = 8.dp)) {
-                            Text("Change Interval")
+                            Button(onClick = { expanded = true }, modifier = Modifier.padding(top = 8.dp)) {
+                                Text("Change Interval")
+                            }
+                            DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+                                intervalOptions.forEach { seconds ->
+                                    DropdownMenuItem(
+                                        text = { Text("${seconds}s") },
+                                        onClick = {
+                                            selectedIntervalSeconds.value = seconds
+                                            expanded = false
+                                        }
+                                    )
+                                }
+                            }
                         }
-                        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-                            intervalOptions.forEach { seconds ->
-                                DropdownMenuItem(
-                                    text = { Text("${seconds}s") },
-                                    onClick = {
-                                        selectedIntervalSeconds.value = seconds
-                                        expanded = false
-                                    }
-                                )
+
+                        if (logging && manual) {
+                            Button(
+                                onClick = {
+                                    manualNameInput.value = ""
+                                    showNameDialog.value = true
+                                },
+                                modifier = Modifier.padding(top = 24.dp)
+                            ) {
+                                Text("LOG CURRENT LOC")
+                            }
+                            if (manualFeedback.isNotBlank()) {
+                                Text(text = manualFeedback, modifier = Modifier.padding(top = 8.dp))
                             }
                         }
 
@@ -225,7 +268,12 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         isLogging.value = LocationLoggingService.isRunning
         if (LocationLoggingService.isRunning) {
-            statusText.value = "Logging every ${selectedIntervalSeconds.value}s... (${LocationLoggingService.rowCount} rows)"
+            manualMode.value = LocationLoggingService.isManualMode
+            statusText.value = if (LocationLoggingService.isManualMode) {
+                "Manual session active (${LocationLoggingService.rowCount} points logged)"
+            } else {
+                "Logging every ${selectedIntervalSeconds.value}s... (${LocationLoggingService.rowCount} rows)"
+            }
         }
     }
 
@@ -277,13 +325,26 @@ class MainActivity : ComponentActivity() {
             action = LocationLoggingService.ACTION_START
             putExtra(LocationLoggingService.EXTRA_INTERVAL_SECONDS, selectedIntervalSeconds.value)
             putExtra(LocationLoggingService.EXTRA_FILE_NAME, sanitizedFileName())
+            putExtra(LocationLoggingService.EXTRA_MANUAL_MODE, manualMode.value)
             if (uriString != null) {
                 putExtra(LocationLoggingService.EXTRA_CUSTOM_URI, uriString)
             }
         }
         ContextCompat.startForegroundService(this, intent)
         isLogging.value = true
-        statusText.value = "Logging started in background."
+        statusText.value = if (manualMode.value) {
+            "Manual session started. Tap LOG CURRENT LOC at each point."
+        } else {
+            "Logging started in background."
+        }
+    }
+
+    private fun logCurrentLocation(name: String) {
+        val intent = Intent(this, LocationLoggingService::class.java).apply {
+            action = LocationLoggingService.ACTION_LOG_MANUAL
+            putExtra(LocationLoggingService.EXTRA_STOP_NAME, name)
+        }
+        startService(intent)
     }
 
     private fun stopService() {
