@@ -150,7 +150,32 @@ class MainActivity : ComponentActivity() {
 
                         var expanded by remember { mutableStateOf(false) }
 
-
+                        if (nameDialogOpen) {
+                            AlertDialog(
+                                onDismissRequest = { showNameDialog.value = false },
+                                title = { Text("Name this location") },
+                                text = {
+                                    OutlinedTextField(
+                                        value = manualName,
+                                        onValueChange = { manualNameInput.value = it },
+                                        label = { Text("Location name") },
+                                        placeholder = { Text("e.g. Stop B") },
+                                        singleLine = true
+                                    )
+                                },
+                                confirmButton = {
+                                    TextButton(onClick = {
+                                        logCurrentLocation(manualNameInput.value)
+                                        showNameDialog.value = false
+                                    }) { Text("Save") }
+                                },
+                                dismissButton = {
+                                    TextButton(onClick = { showNameDialog.value = false }) {
+                                        Text("Cancel")
+                                    }
+                                }
+                            )
+                        }
 
                         Text(text = status)
                         Text(
